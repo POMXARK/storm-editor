@@ -3,6 +3,7 @@
 // (Entity::ShowEditor). The pick outlives the run by its class, in imgui.ini.
 
 #include "attributes_view.hpp"
+#include "selection.hpp"
 
 #include "core.h"
 #include "entity.h"
@@ -12,11 +13,19 @@
 #include "storm/layers.hpp"
 #include "vma.hpp"
 
+#include <map>
 #include <string>
 #include <vector>
 
 namespace storm::editor_tools
 {
+
+entid_t &SelectedEntity()
+{
+    static entid_t selected = invalid_entity;
+    return selected;
+}
+
 namespace
 {
 
@@ -102,22 +111,27 @@ void ShowProperties(Entity &entity)
 
 void ShowEntities(bool &active)
 {
-    static entid_t selected = invalid_entity;
+    entid_t &selected = SelectedEntity();
     static ImGuiTextFilter class_filter;
 
     std::vector<Entity *> entities;
     core.ForEachEntity([&](Entity *entity) { entities.push_back(entity); });
 
-    // the pick of the last run: the first entity of its class
+    // the pick of the last run: its class and which one of the class it was, in the order of the list
     const std::string selected_class = EngineEditor::GetSetting("Entities.Class");
     if (core.GetEntityPointer(selected) == nullptr && !selected_class.empty())
     {
+        const std::string index_setting = EngineEditor::GetSetting("Entities.Index");
+        int index = index_setting.empty() ? 0 : std::stoi(index_setting);
         for (Entity *entity : entities)
         {
             if (selected_class == ClassName(core.GetClassCode(entity->GetId())))
             {
                 selected = entity->GetId();
-                break;
+                if (index-- == 0)
+                {
+                    break;
+                }
             }
         }
     }
@@ -131,10 +145,13 @@ void ShowEntities(bool &active)
             ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed);
             ImGui::TableSetupColumn("Class", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableHeadersRow();
+            // the place of an entity among the ones of its class, the pick is kept by it
+            std::map<std::string, int> class_index;
             for (Entity *entity : entities)
             {
                 const entid_t id = entity->GetId();
                 const char *class_name = ClassName(core.GetClassCode(id));
+                ++class_index[class_name];
                 if (!class_filter.PassFilter(class_name))
                 {
                     continue;
@@ -145,6 +162,7 @@ void ShowEntities(bool &active)
                 {
                     selected = id;
                     EngineEditor::SetSetting("Entities.Class", class_name);
+                    EngineEditor::SetSetting("Entities.Index", std::to_string(class_index[class_name] - 1));
                 }
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(class_name);
