@@ -1,7 +1,8 @@
-// The window "Gizmo": moves and turns the model picked in the window Entities with a gizmo in the
-// scene (ImGuizmo) and by numbers, and copies its place as a line of script. The engine draws a
-// model by its matrix every frame (MODEL::mtx), so the model moves at once; the script may place it
-// again though, as a spinning one is placed every frame.
+// The window "Gizmo": moves and turns the model picked in the window Entities, or the target its
+// module gave (a locator of a location), with a gizmo in the scene (ImGuizmo) and by numbers, and
+// copies its place as a line of script. The engine draws a model by its matrix every frame
+// (MODEL::mtx), so the model moves at once; the script may place it again though, as a spinning
+// one is placed every frame.
 
 #include "selection.hpp"
 
@@ -14,6 +15,8 @@
 #include <ImGuizmo.h>
 #include <fmt/format.h>
 
+#include <algorithm>
+#include <optional>
 #include <string>
 
 namespace storm::editor_tools
@@ -22,14 +25,50 @@ namespace
 {
 
 using storm::editor::EngineEditor;
+using storm::editor::GizmoTarget;
 
 // MSG_MODEL_SET_POSITION: the position, then the axes x, y and z, as model.c of the demos sends it
-std::string ScriptLine(const CMatrix &m)
+std::string ScriptLine(const float *m)
 {
     return fmt::format("SendMessage(&model, \"lffffffffffff\", MSG_MODEL_SET_POSITION, "
                        "{:.3f}, {:.3f}, {:.3f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f});",
-                       m.m[3][0], m.m[3][1], m.m[3][2], m.m[0][0], m.m[0][1], m.m[0][2], m.m[1][0], m.m[1][1],
-                       m.m[1][2], m.m[2][0], m.m[2][1], m.m[2][2]);
+                       m[12], m[13], m[14], m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]);
+}
+
+// What the gizmo moves this frame: the target a module gave for the picked entity (a locator of a
+// location) or the picked model itself
+std::optional<GizmoTarget> Target(entid_t selected)
+{
+    const GizmoTarget *given = EngineEditor::GetGizmoTarget();
+    float matrix[16];
+    if (given != nullptr && given->owner == selected && given->get(matrix))
+    {
+        return *given;
+    }
+    if (dynamic_cast<MODEL *>(core.GetEntityPointer(selected)) == nullptr)
+    {
+        return std::nullopt;
+    }
+    auto model = [selected] { return dynamic_cast<MODEL *>(core.GetEntityPointer(selected)); };
+    GizmoTarget target;
+    target.owner = selected;
+    target.name = "model";
+    target.get = [model](float *matrix) {
+        MODEL *m = model();
+        if (m != nullptr)
+        {
+            std::copy(m->mtx.matrix, m->mtx.matrix + 16, matrix);
+        }
+        return m != nullptr;
+    };
+    target.set = [model](const float *matrix) {
+        if (MODEL *m = model())
+        {
+            std::copy(matrix, matrix + 16, m->mtx.matrix);
+        }
+    };
+    target.script = ScriptLine;
+    return target;
 }
 
 ImGuizmo::OPERATION Operation(const std::string &name)
@@ -45,7 +84,9 @@ void ShowGizmo(bool &active)
     const std::string snap_setting = EngineEditor::GetSetting("Gizmo.Snap");
     float snap = snap_setting.empty() ? 0.f : std::stof(snap_setting);
 
-    auto *model = dynamic_cast<MODEL *>(core.GetEntityPointer(SelectedEntity()));
+    const auto target = Target(SelectedEntity());
+    float matrix[16];
+    const bool has_matrix = target && target->get(matrix);
     auto *renderer = core.GetServiceX<VDX9RENDER>();
 
     if (ImGui::Begin("Gizmo", &active))
@@ -71,33 +112,35 @@ void ShowGizmo(bool &active)
             EngineEditor::SetSetting("Gizmo.Snap", fmt::format("{:.2f}", snap));
         }
 
-        if (model == nullptr)
+        if (!has_matrix)
         {
-            ImGui::TextDisabled("Pick a model (MODELR) in the window Entities");
+            ImGui::TextDisabled("Pick a model (MODELR) in the window Entities,");
+            ImGui::TextDisabled("or a locator of a location in Entity Properties");
         }
         else
         {
-            CMatrix &m = model->mtx;
+            ImGui::TextUnformatted(target->name.c_str());
             float position[3], rotation[3], scale[3];
-            ImGuizmo::DecomposeMatrixToComponents(m.matrix, position, rotation, scale);
+            ImGuizmo::DecomposeMatrixToComponents(matrix, position, rotation, scale);
             bool changed = ImGui::DragFloat3("Position", position, 0.01f, 0.f, 0.f, "%.3f");
             changed |= ImGui::DragFloat3("Rotation", rotation, 0.5f, 0.f, 0.f, "%.1f");
             if (changed)
             {
-                ImGuizmo::RecomposeMatrixFromComponents(position, rotation, scale, m.matrix);
+                ImGuizmo::RecomposeMatrixFromComponents(position, rotation, scale, matrix);
+                target->set(matrix);
             }
-            if (ImGui::Button("Copy as script"))
+            if (target->script && ImGui::Button("Copy as script"))
             {
-                const std::string line = ScriptLine(m);
+                const std::string line = target->script(matrix);
                 ImGui::SetClipboardText(line.c_str());
                 core.Trace("EDITOR: %s", line.c_str());
             }
-            ImGui::SetItemTooltip("MSG_MODEL_SET_POSITION with this place, also into compile.log");
+            ImGui::SetItemTooltip("The place as a line of script or of a generator, also into compile.log");
         }
     }
     ImGui::End();
 
-    if (model == nullptr || renderer == nullptr)
+    if (!has_matrix || renderer == nullptr)
     {
         return;
     }
@@ -111,8 +154,11 @@ void ShowGizmo(bool &active)
     ImGuizmo::SetDrawlist(ImGui::GetBackgroundDrawList());
     ImGuizmo::SetRect(0, 0, io.DisplaySize.x, io.DisplaySize.y);
     const float snap_values[3] = {snap, snap, snap};
-    ImGuizmo::Manipulate(&view._11, &projection._11, Operation(operation), world ? ImGuizmo::WORLD : ImGuizmo::LOCAL,
-                         model->mtx.matrix, nullptr, snap > 0.f ? snap_values : nullptr);
+    if (ImGuizmo::Manipulate(&view._11, &projection._11, Operation(operation), world ? ImGuizmo::WORLD : ImGuizmo::LOCAL,
+                             matrix, nullptr, snap > 0.f ? snap_values : nullptr))
+    {
+        target->set(matrix);
+    }
 }
 
 // the module registers its window when it is linked into the engine
