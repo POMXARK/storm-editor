@@ -2,7 +2,9 @@
 // window Assets (a .gm dropped on Viewport lands where the mouse points, on a model or the ground) or from
 // the list "Add model"; a click in Viewport picks one (in the edit), the Gizmo moves it. The scene is saved
 // to resource/scenes/<name>.scene, a script loads it with LoadScene. Ctrl+Z / Ctrl+Y undo and redo every
-// change; Play keeps the scene and Stop gives it back as it was.
+// change; Play keeps the scene and Stop gives it back as it was. A model may be animated (its skeleton and
+// the action it plays); a marker is a named place for the script (the player, an NPC): Add marker puts one,
+// Viewport shows it as a ring with its name and the Gizmo moves it.
 
 #include "selection.hpp"
 
@@ -20,6 +22,8 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <vector>
@@ -37,6 +41,9 @@ constexpr size_t kUndoDepth = 200;
 // where a model goes when the mouse points at nothing: this far ahead of the camera, metres
 constexpr float kAhead = 8.f;
 constexpr float kRayLength = 1000.f;
+// a click this near to a marker on the screen picks it, pixels; its ring is this big, metres
+constexpr float kMarkerPick = 14.f;
+constexpr float kMarkerRadius = 0.4f;
 
 using Objects = std::vector<SceneObject>;
 
@@ -75,12 +82,20 @@ bool SameFile(const Objects &a, const Objects &b)
            std::equal(a.begin(), a.end(), b.begin(), [](const SceneObject &x, const SceneObject &y) { return x.SameAs(y); });
 }
 
+// the marker picked: it has no entity, so it is picked while no entity is
+uint32_t &SelectedMarkerId()
+{
+    static uint32_t id = 0;
+    return id;
+}
+
 SceneObject *Selected()
 {
     const entid_t selected = SelectedEntity();
     for (SceneObject &object : CurrentScene().objects)
     {
-        if (object.entity != invalid_entity && object.entity == selected)
+        if (object.marker ? selected == invalid_entity && object.id == SelectedMarkerId()
+                          : object.entity != invalid_entity && object.entity == selected)
         {
             return &object;
         }
@@ -91,6 +106,44 @@ SceneObject *Selected()
 void Select(entid_t entity)
 {
     SelectedEntity() = entity;
+    SelectedMarkerId() = 0;
+}
+
+SceneObject *FindObject(uint32_t id)
+{
+    Objects &objects = CurrentScene().objects;
+    const auto it = std::find_if(objects.begin(), objects.end(), [id](const SceneObject &o) { return o.id == id; });
+    return it != objects.end() ? &*it : nullptr;
+}
+
+// A marker goes to the window Gizmo as its target: owned by no entity, it shows while none is picked
+void SelectMarker(uint32_t id)
+{
+    Select(invalid_entity);
+    SelectedMarkerId() = id;
+    storm::editor::GizmoTarget target;
+    target.owner = invalid_entity;
+    target.name = "marker";
+    target.get = [id](float *matrix) {
+        const SceneObject *object = SelectedMarkerId() == id ? FindObject(id) : nullptr;
+        if (object != nullptr)
+        {
+            std::copy(object->matrix, object->matrix + 16, matrix);
+        }
+        return object != nullptr;
+    };
+    target.set = [id](const float *matrix) {
+        if (SceneObject *object = FindObject(id))
+        {
+            std::copy(matrix, matrix + 16, object->matrix);
+        }
+    };
+    target.script = [id](const float *m) {
+        const SceneObject *object = FindObject(id);
+        return fmt::format("GetSceneMarker(\"{}\", &place); // {:.3f}, {:.3f}, {:.3f}, ay {:.4f}",
+                           object != nullptr ? object->name : "", m[12], m[13], m[14], std::atan2(m[8], m[10]));
+    };
+    EngineEditor::SetGizmoTarget(std::move(target));
 }
 
 // The scene becomes the one given: the models that are the same stay and move, the others are made anew
@@ -105,8 +158,13 @@ void Apply(const Objects &target)
     Objects next = target;
     for (SceneObject &object : next)
     {
+        if (object.marker)
+        {
+            continue;
+        }
         const auto it = std::find_if(objects.begin(), objects.end(), [&](const SceneObject &o) { return o.id == object.id; });
         if (it != objects.end() && it->geometry == object.geometry && it->technique == object.technique &&
+            it->textures == object.textures && it->animation == object.animation && it->action == object.action &&
             core.GetEntityPointerSafe(it->entity) != nullptr)
         {
             object.entity = it->entity;
@@ -127,7 +185,7 @@ void Apply(const Objects &target)
     {
         if (object.id == selected_id)
         {
-            Select(object.entity);
+            object.marker ? SelectMarker(object.id) : Select(object.entity);
         }
     }
 }
@@ -389,6 +447,40 @@ CVECTOR DropPoint(float x, float y)
     return ray->from + ray->direction * kAhead;
 }
 
+// The folder of resource/textures a model's textures are in: that of the model when its .gm names them
+// without a folder (a character in models/characters, textures/characters) and they lie there
+std::string TextureFolder(const std::string &geometry)
+{
+    const size_t slash = geometry.find_last_of('\\');
+    if (slash == std::string::npos)
+    {
+        return {};
+    }
+    std::string path = "resource/models/" + geometry + ".gm";
+    std::replace(path.begin(), path.end(), '\\', '/');
+    std::ifstream in(path, std::ios::binary);
+    const std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    // the names of the .gm are zero-ended strings; the first one of a texture tells how they are given
+    for (size_t end = data.find(".tga"); end != std::string::npos; end = data.find(".tga", end + 1))
+    {
+        size_t begin = end;
+        while (begin > 0 && data[begin - 1] >= ' ' && data[begin - 1] < 127)
+        {
+            --begin;
+        }
+        const std::string name = data.substr(begin, end + 4 - begin);
+        if (name.find('\\') != std::string::npos || name.find('/') != std::string::npos)
+        {
+            return {};
+        }
+        const std::string folder = geometry.substr(0, slash);
+        std::string texture = "resource/textures/" + folder + "/" + name + ".tx";
+        std::replace(texture.begin(), texture.end(), '\\', '/');
+        return fs::exists(texture) ? folder : std::string();
+    }
+    return {};
+}
+
 void AddModel(const std::string &geometry, const CVECTOR &at)
 {
     SceneObject object;
@@ -396,6 +488,7 @@ void AddModel(const std::string &geometry, const CVECTOR &at)
     std::string base = geometry.substr(geometry.find_last_of('\\') + 1);
     object.name = FreeName(base);
     object.technique = EngineEditor::GetSetting("Scene.Technique");
+    object.textures = TextureFolder(geometry);
     object.matrix[12] = at.x;
     object.matrix[13] = at.y;
     object.matrix[14] = at.z;
@@ -416,6 +509,129 @@ CVECTOR ViewCentre()
     return DropPoint(rect.x + rect.width / 2.f, rect.y + rect.height / 2.f);
 }
 
+void AddMarker(const CVECTOR &at)
+{
+    SceneObject object;
+    object.marker = true;
+    object.name = FreeName("marker");
+    object.matrix[12] = at.x;
+    object.matrix[13] = at.y;
+    object.matrix[14] = at.z;
+    object.id = ++State().lastId;
+    CurrentScene().objects.push_back(object);
+    SelectMarker(object.id);
+}
+
+// A point of the world on the screen, nullopt behind the camera
+std::optional<ImVec2> ToScreen(const float *point)
+{
+    auto *renderer = core.GetServiceX<VDX9RENDER>();
+    const storm::editor::ViewportRect rect = EngineEditor::GetViewportRect();
+    if (renderer == nullptr || rect.width <= 0.f)
+    {
+        return std::nullopt;
+    }
+    D3DMATRIX view, projection;
+    renderer->GetTransform(D3DTS_VIEW, &view);
+    renderer->GetTransform(D3DTS_PROJECTION, &projection);
+    // D3D rows: the point times the view, then times the projection
+    const float *v = &view._11;
+    const float *p = &projection._11;
+    float eye[4], clip[4];
+    for (int j = 0; j < 4; ++j)
+    {
+        eye[j] = point[0] * v[j] + point[1] * v[4 + j] + point[2] * v[8 + j] + v[12 + j];
+    }
+    for (int j = 0; j < 4; ++j)
+    {
+        clip[j] = eye[0] * p[j] + eye[1] * p[4 + j] + eye[2] * p[8 + j] + eye[3] * p[12 + j];
+    }
+    if (clip[3] < 0.05f)
+    {
+        return std::nullopt;
+    }
+    return ImVec2(rect.x + (clip[0] / clip[3] + 1.f) * 0.5f * rect.width,
+                  rect.y + (1.f - clip[1] / clip[3]) * 0.5f * rect.height);
+}
+
+// The markers over the frame: a ring on the ground of the marker, an arrow where it looks, its name
+void DrawMarkers()
+{
+    ImDrawList *draw = EngineEditor::GetViewportDrawList();
+    const storm::editor::ViewportRect rect = EngineEditor::GetViewportRect();
+    // as gizmos of Unity: over the edit, not over the game
+    if (draw == nullptr || rect.width <= 0.f || EngineEditor::IsPlaying())
+    {
+        return;
+    }
+    const SceneObject *selected = Selected();
+    draw->PushClipRect(ImVec2(rect.x, rect.y), ImVec2(rect.x + rect.width, rect.y + rect.height), true);
+    for (const SceneObject &object : CurrentScene().objects)
+    {
+        if (!object.marker)
+        {
+            continue;
+        }
+        const float *m = object.matrix;
+        const ImU32 colour = &object == selected ? IM_COL32(255, 220, 60, 255) : IM_COL32(80, 230, 255, 230);
+        constexpr int kSteps = 24;
+        ImVec2 ring[kSteps];
+        int shown = 0;
+        for (int i = 0; i < kSteps; ++i)
+        {
+            const float a = 6.2831853f * i / kSteps;
+            const float point[3] = {m[12] + std::cos(a) * kMarkerRadius, m[13], m[14] + std::sin(a) * kMarkerRadius};
+            if (const auto at = ToScreen(point))
+            {
+                ring[shown++] = *at;
+            }
+        }
+        const float tip[3] = {m[12] + m[8] * kMarkerRadius * 2.f, m[13], m[14] + m[10] * kMarkerRadius * 2.f};
+        const float head[3] = {m[12], m[13] + 1.8f, m[14]};
+        const auto centre = ToScreen(m + 12);
+        const auto front = ToScreen(tip);
+        const auto top = ToScreen(head);
+        if (!centre || shown < kSteps)
+        {
+            continue;
+        }
+        draw->AddPolyline(ring, kSteps, colour, ImDrawFlags_Closed, 2.f);
+        if (front)
+        {
+            draw->AddLine(*centre, *front, colour, 3.f);
+        }
+        if (top)
+        {
+            // a post as high as a man, so the place reads as the place of a character
+            draw->AddLine(*centre, *top, colour, 1.f);
+            draw->AddText(ImVec2(top->x + 4.f, top->y - 14.f), colour, object.name.c_str());
+        }
+    }
+    draw->PopClipRect();
+}
+
+// The marker near a point of the screen
+std::optional<uint32_t> PickMarker(float x, float y)
+{
+    std::optional<uint32_t> nearest;
+    float best = kMarkerPick;
+    for (const SceneObject &object : CurrentScene().objects)
+    {
+        const auto at = object.marker ? ToScreen(object.matrix + 12) : std::nullopt;
+        if (!at)
+        {
+            continue;
+        }
+        const float distance = std::hypot(at->x - x, at->y - y);
+        if (distance < best)
+        {
+            best = distance;
+            nearest = object.id;
+        }
+    }
+    return nearest;
+}
+
 void Duplicate(const SceneObject &source)
 {
     SceneObject copy = source;
@@ -424,7 +640,12 @@ void Duplicate(const SceneObject &source)
     copy.name = FreeName(source.name);
     // a step aside, so the copy is seen
     copy.matrix[12] += 0.5f;
-    if (Spawn(copy))
+    if (copy.marker)
+    {
+        CurrentScene().objects.push_back(copy);
+        SelectMarker(copy.id);
+    }
+    else if (Spawn(copy))
     {
         CurrentScene().objects.push_back(copy);
         Select(copy.entity);
@@ -441,6 +662,25 @@ void Delete(uint32_t id)
         objects.erase(it);
         Select(invalid_entity);
     }
+}
+
+// The actions of resource/animation/<name>.ani: its [sections]
+std::vector<std::string> Actions(const std::string &animation)
+{
+    std::string path = "resource/animation/" + animation + ".ani";
+    std::replace(path.begin(), path.end(), '\\', '/');
+    std::ifstream in(path);
+    std::vector<std::string> actions;
+    for (std::string line; std::getline(in, line);)
+    {
+        const size_t open = line.find_first_not_of(" \t");
+        const size_t close = line.find(']');
+        if (open != std::string::npos && line[open] == '[' && close != std::string::npos && close > open + 1)
+        {
+            actions.push_back(line.substr(open + 1, close - open - 1));
+        }
+    }
+    return actions;
 }
 
 std::vector<std::string> Files(const fs::path &root, const char *extension)
@@ -513,6 +753,11 @@ void ViewportInput()
     }
     if (EngineEditor::TakeViewportClick(x, y) && !EngineEditor::IsPlaying() && !ImGuizmo::IsOver() && !ImGuizmo::IsUsing())
     {
+        if (const auto marker = PickMarker(x, y))
+        {
+            SelectMarker(*marker);
+            return;
+        }
         const auto ray = ScreenRay(x, y);
         const auto hit = ray ? Pick(*ray) : std::nullopt;
         Select(hit ? hit->first : invalid_entity);
@@ -626,12 +871,18 @@ void FileButtons()
         }
         ImGui::EndPopup();
     }
+    // on a line of its own: next to the others it hides behind the edge of a narrow panel
+    if (ImGui::Button("Add marker"))
+    {
+        AddMarker(ViewCentre());
+    }
+    ImGui::SetItemTooltip("A named place for the script: the player, an NPC (GetSceneMarker)");
 }
 
 void ObjectList()
 {
     Objects &objects = CurrentScene().objects;
-    const entid_t selected = SelectedEntity();
+    const SceneObject *selected = Selected();
     std::optional<uint32_t> remove;
     std::optional<SceneObject> duplicate;
     if (ImGui::BeginChild("objects", ImVec2(0.f, ImGui::GetContentRegionAvail().y * 0.55f), ImGuiChildFlags_Border))
@@ -643,10 +894,10 @@ void ObjectList()
         for (SceneObject &object : objects)
         {
             ImGui::PushID(static_cast<int>(object.id));
-            const bool missing = core.GetEntityPointerSafe(object.entity) == nullptr;
-            if (ImGui::Selectable(object.name.c_str(), !missing && object.entity == selected))
+            const bool missing = !object.marker && core.GetEntityPointerSafe(object.entity) == nullptr;
+            if (ImGui::Selectable(object.name.c_str(), &object == selected))
             {
-                Select(object.entity);
+                object.marker ? SelectMarker(object.id) : Select(object.entity);
             }
             if (ImGui::BeginPopupContextItem())
             {
@@ -661,7 +912,15 @@ void ObjectList()
                 ImGui::EndPopup();
             }
             ImGui::SameLine();
-            ImGui::TextDisabled("%s%s", object.geometry.c_str(), missing ? "  (not loaded)" : "");
+            if (object.marker)
+            {
+                ImGui::TextColored(ImVec4(0.3f, 0.9f, 1.f, 1.f), "marker");
+            }
+            else
+            {
+                ImGui::TextDisabled("%s%s%s%s", object.geometry.c_str(), object.action.empty() ? "" : "  > ",
+                                    object.action.c_str(), missing ? "  (not loaded)" : "");
+            }
             ImGui::PopID();
         }
     }
@@ -681,7 +940,7 @@ void ObjectProperties()
     SceneObject *object = Selected();
     if (object == nullptr)
     {
-        ImGui::TextDisabled("Pick a model in the list or with a click in Viewport (in the edit)");
+        ImGui::TextDisabled("Pick a model or a marker in the list or with a click in Viewport (in the edit)");
         return;
     }
     char name[64];
@@ -690,20 +949,61 @@ void ObjectProperties()
     {
         object->name = name;
     }
-    ImGui::LabelText("Geometry", "%s", object->geometry.c_str());
-    char technique[64];
-    std::snprintf(technique, sizeof(technique), "%s", object->technique.c_str());
-    if (ImGui::InputText("Technique", technique, sizeof(technique), ImGuiInputTextFlags_EnterReturnsTrue))
+    if (object->marker)
     {
-        // the technique is set as the model is made, so it is made anew
+        ImGui::TextDisabled("A place for the script, it puts the player or an NPC here:");
+        ImGui::TextDisabled("GetSceneMarker(\"%s\", &place) gives place.x, .y, .z, .ay", object->name.c_str());
+        ImGui::TextDisabled("Move and turn it with the window Gizmo; the arrow is where it looks");
+        return;
+    }
+    ImGui::LabelText("Geometry", "%s", object->geometry.c_str());
+    // the technique, the skeleton and the action are set as the model is made, so it is made anew
+    auto remake = [object](std::string SceneObject::*field, const char *value) {
         SceneObject changed = *object;
-        changed.technique = technique;
+        changed.*field = value;
         Despawn(*object);
         *object = changed;
         Spawn(*object);
         Select(object->entity);
+    };
+    char technique[64];
+    std::snprintf(technique, sizeof(technique), "%s", object->technique.c_str());
+    if (ImGui::InputText("Technique", technique, sizeof(technique), ImGuiInputTextFlags_EnterReturnsTrue))
+    {
+        remake(&SceneObject::technique, technique);
     }
     ImGui::SetItemTooltip("The shader technique of the model (resource/techniques), Enter to set; empty for its own");
+    char textures[64];
+    std::snprintf(textures, sizeof(textures), "%s", object->textures.c_str());
+    if (ImGui::InputText("Textures", textures, sizeof(textures), ImGuiInputTextFlags_EnterReturnsTrue))
+    {
+        remake(&SceneObject::textures, textures);
+    }
+    ImGui::SetItemTooltip("The folder of resource/textures its texture names are in (characters), Enter to set;\n"
+                          "empty when the names carry their folder. Set by itself as the model is added");
+    char animation[64];
+    std::snprintf(animation, sizeof(animation), "%s", object->animation.c_str());
+    if (ImGui::InputText("Animation", animation, sizeof(animation), ImGuiInputTextFlags_EnterReturnsTrue))
+    {
+        remake(&SceneObject::animation, animation);
+    }
+    ImGui::SetItemTooltip("The skeleton of a skinned model: resource/animation/<name>.ani, Enter to set; empty for none");
+    if (!object->animation.empty())
+    {
+        const auto actions = Actions(object->animation);
+        if (ImGui::BeginCombo("Action", object->action.empty() ? "(none)" : object->action.c_str()))
+        {
+            for (const std::string &action : actions)
+            {
+                if (ImGui::Selectable(action.c_str(), action == object->action))
+                {
+                    remake(&SceneObject::action, action.c_str());
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SetItemTooltip("What it plays from the start (an NPC standing by: idle); the game may play another");
+    }
     ImGui::TextDisabled("Move and turn it with the window Gizmo");
 }
 
@@ -746,6 +1046,7 @@ void ShowScene(bool &active)
     ViewportInput();
     Shortcuts();
     Commit();
+    DrawMarkers();
 
     if (ImGui::Begin("Scene", &active))
     {

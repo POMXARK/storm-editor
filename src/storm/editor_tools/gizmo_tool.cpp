@@ -41,7 +41,7 @@ std::optional<GizmoTarget> Target(entid_t selected)
 {
     const GizmoTarget *given = EngineEditor::GetGizmoTarget();
     float matrix[16];
-    if (given != nullptr && given->owner == selected && given->get(matrix))
+    if (given != nullptr && given->owner == selected && given->get && given->get(matrix))
     {
         return *given;
     }
