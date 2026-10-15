@@ -4,6 +4,8 @@
 
 ![Рабочее место](media/workspace.jpg)
 
+Как пользоваться: [docs/ru/09-editor.md](https://github.com/POMXARK/storm-engine/blob/miniaudio-sound/docs/ru/09-editor.md) — рабочее место, Edit/Play, свободная камера, сцена с нуля, клавиши.
+
 ![Инспектор атрибутов](media/inspector.jpg)
 
 ## Окна
@@ -13,6 +15,7 @@
 | Entities | все сущности движка с классом, фильтр по классу |
 | Entity Properties | слои и приоритеты выбранной сущности, дерево её атрибутов с правкой на лету: числа тянутся мышью, цвета `argb` — палитрой, текст — по Enter; правка доходит до сущности через `AttributeChanged`, как присваивание из скрипта |
 | Gizmo | двигает и поворачивает выбранную модель или локатор локации (ветка **Locators** в Entity Properties) гизмо ImGuizmo в кадре или числами, оси модели или мира, шаг; **Copy as script** — строка `MSG_MODEL_SET_POSITION` для скрипта (в буфер и в `compile.log`) |
+| Scene | сцена из моделей: перетащить .gm из Assets во Viewport или Add model, выбор щелчком в кадре, Duplicate/Delete, Undo/Redo (Ctrl+Z/Ctrl+Y), New/Open/Save в `resource/scenes/*.scene` (TOML), скрипт грузит её `LoadScene`; Stop возвращает сцену, какой она была при Play |
 | Console | логи движка по вкладкам: system, error (красная, если не пуст), compile (скрипты и Trace); фильтр, «Errors only», Clear |
 | Assets | дерево `resource/` и `program/` с типом и размером, текст .ini/.ani/.c/.fx справа |
 | Animation | анимация выбранной модели или персонажа (`EngineEditor::ModelOf`): проигрыватели с действием, позицией, скоростью и Play/Pause/Stop; действия .ani полосами на кадрах .an с событиями и данными, щелчок играет действие; граф переходов, увиденных пока окно открыто |

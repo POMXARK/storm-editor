@@ -117,9 +117,12 @@ void ShowEntities(bool &active)
     std::vector<Entity *> entities;
     core.ForEachEntity([&](Entity *entity) { entities.push_back(entity); });
 
-    // the pick of the last run: its class and which one of the class it was, in the order of the list
+    // the pick of the last run: its class and which one of the class it was, in the order of the list.
+    // It comes back once: a pick dropped later (a model deleted, Undo) stays dropped
+    static bool restored = false;
+    restored = restored || core.GetEntityPointer(selected) != nullptr;
     const std::string selected_class = EngineEditor::GetSetting("Entities.Class");
-    if (core.GetEntityPointer(selected) == nullptr && !selected_class.empty())
+    if (!restored && core.GetEntityPointer(selected) == nullptr && !selected_class.empty())
     {
         const std::string index_setting = EngineEditor::GetSetting("Entities.Index");
         int index = index_setting.empty() ? 0 : std::stoi(index_setting);
@@ -128,6 +131,7 @@ void ShowEntities(bool &active)
             if (selected_class == ClassName(core.GetClassCode(entity->GetId())))
             {
                 selected = entity->GetId();
+                restored = true;
                 if (index-- == 0)
                 {
                     break;

@@ -1,6 +1,6 @@
 // The window "Assets": the files of the game the engine loads, the folders of resource/ and the scripts
 // of the program folder, as a tree with the kind and the size of every file. A text one (.ini, .ani, .c)
-// shows on the right; the picked file is kept between runs.
+// shows on the right; the picked file is kept between runs. A file is dragged onto Viewport by its path.
 
 #include "core.h"
 #include "storm/editor/engine_editor.hpp"
@@ -140,6 +140,13 @@ void ShowTree(const Entry &entry, const ImGuiTextFilter &filter, const std::stri
         if (ImGui::IsItemClicked())
         {
             EngineEditor::SetSetting("Assets.File", path);
+        }
+        // a file is dragged out by its path: a model onto Viewport goes into the scene (window Scene)
+        if (ImGui::BeginDragDropSource())
+        {
+            ImGui::SetDragDropPayload("STORM_ASSET", path.c_str(), path.size() + 1);
+            ImGui::Text("%s", name.c_str());
+            ImGui::EndDragDropSource();
         }
         ImGui::TableNextColumn();
         ImGui::TextDisabled("%s", Kind(child.path));
