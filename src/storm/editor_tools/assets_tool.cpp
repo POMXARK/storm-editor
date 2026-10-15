@@ -1,18 +1,24 @@
 // The window "Assets": the files of the game the engine loads, the folders of resource/ and the scripts
 // of the program folder, as a tree with the kind and the size of every file. A text one (.ini, .ani, .c)
 // shows on the right; the picked file is kept between runs. A file is dragged onto Viewport by its path.
+// A glTF model (.glb, .gltf, from Blender and others) is imported: the button Import runs the converter
+// tools/gltf2gm, put next to the engine by the build, and the new .gm is picked to be dragged.
 
 #include "core.h"
+#include "file_service.h"
 #include "storm/editor/engine_editor.hpp"
 #include "storm/editor/storm_imgui.hpp"
 
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace storm::editor_tools
@@ -24,7 +30,7 @@ using storm::editor::EngineEditor;
 namespace fs = std::filesystem;
 
 // the engine runs from the folder of the game
-const std::vector<std::string> kRoots = {"resource", "program"};
+const std::vector<std::string> kRoots = {"resource", "program", "source"};
 // a text shown is cut here
 constexpr std::uintmax_t kTextLimit = 256 * 1024;
 
@@ -33,6 +39,7 @@ const std::map<std::string, const char *> kKinds = {
     {".tga", "texture"},     {".dds", "texture"},   {".wav", "sound"},     {".ogg", "sound"},
     {".mp3", "sound"},       {".ini", "settings"},  {".c", "script"},      {".h", "script"},
     {".fx", "shader"},       {".ttf", "font"},      {".txt", "text"},      {".col", "collision"},
+    {".glb", "glTF"},        {".gltf", "glTF"},
 };
 
 const char *Kind(const fs::path &path)
@@ -60,6 +67,90 @@ std::string Size(std::uintmax_t bytes)
         return fmt::format("{:.1f} KB", bytes / 1024.0);
     }
     return fmt::format("{:.1f} MB", bytes / (1024.0 * 1024.0));
+}
+
+// the import of a glTF file, run by the converter in its own thread so the frame goes on
+struct Import
+{
+    std::mutex mutex;
+    bool running = false;
+    bool done = false;
+    std::string file;
+    std::string output;
+    std::string model;
+};
+
+Import import_;
+
+#ifdef _WIN32
+#define STORM_POPEN _popen
+#define STORM_PCLOSE _pclose
+constexpr const char *kPython = "python";
+#else
+#define STORM_POPEN popen
+#define STORM_PCLOSE pclose
+constexpr const char *kPython = "python3";
+#endif
+
+void RunImport(std::string file, std::string folder)
+{
+    const fs::path tool = fs::path(fio->_GetExecutableDirectory()) / "tools" / "gltf2gm" / "gltf2gm.py";
+    const std::string command = fmt::format("{} -I \"{}\" \"{}\" --out resource --folder \"{}\" 2>&1", kPython,
+                                            tool.string(), file, folder);
+    std::string output;
+    int status = -1;
+    if (FILE *pipe = STORM_POPEN(command.c_str(), "r"))
+    {
+        char buffer[512];
+        while (fgets(buffer, sizeof(buffer), pipe))
+        {
+            output += buffer;
+        }
+        status = STORM_PCLOSE(pipe);
+    }
+    if (!fs::exists(tool))
+    {
+        output = fmt::format("no converter {}: build the engine target to copy it", tool.string());
+    }
+    const fs::path model = fs::path("resource") / "models" / folder / (fs::path(file).stem().string() + ".gm");
+    std::lock_guard lock(import_.mutex);
+    import_.running = false;
+    import_.done = true;
+    import_.output = output;
+    import_.model = status == 0 && fs::exists(model) ? model.generic_string() : std::string();
+    core.Trace("EDITOR: import %s: %s", file.c_str(), import_.model.empty() ? "failed" : import_.model.c_str());
+}
+
+void ShowImport(const std::string &selected)
+{
+    static char folder[64] = "";
+    if (!folder[0])
+    {
+        const std::string saved = EngineEditor::GetSetting("Assets.ImportFolder");
+        fmt::format_to_n(folder, sizeof(folder) - 1, "{}", saved.empty() ? "imported" : saved);
+    }
+    ImGui::Separator();
+    ImGui::SetNextItemWidth(140.f);
+    if (ImGui::InputText("Folder", folder, sizeof(folder)))
+    {
+        EngineEditor::SetSetting("Assets.ImportFolder", folder);
+    }
+    std::lock_guard lock(import_.mutex);
+    ImGui::BeginDisabled(import_.running || !folder[0]);
+    if (ImGui::Button(import_.running ? "Importing..." : "Import"))
+    {
+        import_.running = true;
+        import_.done = false;
+        import_.file = selected;
+        std::thread(RunImport, selected, std::string(folder)).detach();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled("to resource/models/%s, textures/%s", folder, folder);
+    if (import_.file == selected && !import_.output.empty())
+    {
+        ImGui::TextWrapped("%s", import_.output.c_str());
+    }
 }
 
 struct Entry
@@ -174,6 +265,20 @@ void ShowFile(const std::string &selected)
     {
         ImGui::SetClipboardText(selected.c_str());
     }
+    {
+        // the model just imported tells what the converter made of it
+        std::lock_guard lock(import_.mutex);
+        if (!import_.model.empty() && import_.model == selected)
+        {
+            ImGui::TextWrapped("Imported from %s, drag it onto Viewport:\n%s", import_.file.c_str(),
+                               import_.output.c_str());
+        }
+    }
+    if (std::string(Kind(path)) == "glTF")
+    {
+        ShowImport(selected);
+        return;
+    }
     if (!IsText(path))
     {
         return;
@@ -203,7 +308,21 @@ void ShowAssets(bool &active)
         ImGui::End();
         return;
     }
-    if (roots.empty() || ImGui::Button("Rescan"))
+    // a finished import shows its model: the tree is read again and the new .gm picked
+    bool imported = false;
+    {
+        std::lock_guard lock(import_.mutex);
+        if (import_.done)
+        {
+            import_.done = false;
+            imported = true;
+            if (!import_.model.empty())
+            {
+                EngineEditor::SetSetting("Assets.File", import_.model);
+            }
+        }
+    }
+    if (roots.empty() || ImGui::Button("Rescan") || imported)
     {
         roots.clear();
         for (const std::string &root : kRoots)
