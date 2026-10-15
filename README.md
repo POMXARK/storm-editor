@@ -1,6 +1,8 @@
 # Storm Editor
 
-Окна инструментов встроенного редактора [Storm Engine](https://github.com/POMXARK/storm-engine) (ветка `miniaudio-sound`): движок запускается с `--editor`, поверх кадра открывается ImGui. Работает на Windows и Linux (d3d9 через dxvk-native).
+Окна инструментов встроенного редактора [Storm Engine](https://github.com/POMXARK/storm-engine) (ветка `miniaudio-sound`). Движок запускается с `--editor` и открывает рабочее место на ImGui: игра в окне Viewport, вокруг панели иерархии, инспектора, ассетов и консоли, сверху Pause/Step и свободная камера (сама раскладка — в движке, `src/libs/editor`). Работает на Windows и Linux (d3d9 через dxvk-native).
+
+![Рабочее место](media/workspace.jpg)
 
 ![Инспектор атрибутов](media/inspector.jpg)
 
@@ -11,6 +13,8 @@
 | Entities | все сущности движка с классом, фильтр по классу |
 | Entity Properties | слои и приоритеты выбранной сущности, дерево её атрибутов с правкой на лету: числа тянутся мышью, цвета `argb` — палитрой, текст — по Enter; правка доходит до сущности через `AttributeChanged`, как присваивание из скрипта |
 | Gizmo | двигает и поворачивает выбранную модель или локатор локации (ветка **Locators** в Entity Properties) гизмо ImGuizmo в кадре или числами, оси модели или мира, шаг; **Copy as script** — строка `MSG_MODEL_SET_POSITION` для скрипта (в буфер и в `compile.log`) |
+| Console | логи движка по вкладкам: system, error (красная, если не пуст), compile (скрипты и Trace); фильтр, «Errors only», Clear |
+| Assets | дерево `resource/` и `program/` с типом и размером, текст .ini/.ani/.c/.fx справа |
 | Animation | анимация выбранной модели или персонажа (`EngineEditor::ModelOf`): проигрыватели с действием, позицией, скоростью и Play/Pause/Stop; действия .ani полосами на кадрах .an с событиями и данными, щелчок играет действие; граф переходов, увиденных пока окно открыто |
 
 ![Гизмо](media/gizmo.jpg)
@@ -20,6 +24,8 @@
 Для локатора **Copy as script** даёт метку генератора (`("item", "crate2", (x, y, z), (dx, dz)),`). Свой объект для гизмо модуль движка отдаёт через `EngineEditor::SetGizmoTarget` — так это делает `Location::ShowEditor`.
 
 ![Анимация](media/animation.jpg)
+
+Окна, которые рисуют в сцене, берут кадр игры из `EngineEditor::GetViewportRect()` и `GetViewportDrawList()`: в рабочем месте это окно Viewport, в оверлее — весь экран.
 
 Модуль, у сущности которого модель лежит внутри (персонаж), сообщает о ней через `EngineEditor::RegisterModelOf`, тогда Animation и другие окна находят модель по выбранной сущности.
 

@@ -144,21 +144,26 @@ void ShowGizmo(bool &active)
     {
         return;
     }
-    // the gizmo is drawn under the windows, over the whole frame, with the matrices of the camera
+    // the gizmo is drawn over the frame of the game (the window Viewport, or the whole screen under the
+    // windows), with the matrices of the camera
     D3DMATRIX view, projection;
     renderer->GetTransform(D3DTS_VIEW, &view);
     renderer->GetTransform(D3DTS_PROJECTION, &projection);
-    const ImGuiIO &io = ImGui::GetIO();
+    const storm::editor::ViewportRect rect = EngineEditor::GetViewportRect();
     ImGuizmo::BeginFrame();
     ImGuizmo::SetOrthographic(false);
-    ImGuizmo::SetDrawlist(ImGui::GetBackgroundDrawList());
-    ImGuizmo::SetRect(0, 0, io.DisplaySize.x, io.DisplaySize.y);
+    ImDrawList *draw = EngineEditor::GetViewportDrawList();
+    ImGuizmo::SetDrawlist(draw);
+    ImGuizmo::SetRect(rect.x, rect.y, rect.width, rect.height);
+    // a model out of the frame keeps its gizmo out of sight too
+    draw->PushClipRect(ImVec2(rect.x, rect.y), ImVec2(rect.x + rect.width, rect.y + rect.height), true);
     const float snap_values[3] = {snap, snap, snap};
     if (ImGuizmo::Manipulate(&view._11, &projection._11, Operation(operation), world ? ImGuizmo::WORLD : ImGuizmo::LOCAL,
                              matrix, nullptr, snap > 0.f ? snap_values : nullptr))
     {
         target->set(matrix);
     }
+    draw->PopClipRect();
 }
 
 // the module registers its window when it is linked into the engine
