@@ -6,7 +6,10 @@
 // the action it plays); a marker is a named place for the script (the player, an NPC): Add marker puts one,
 // Viewport shows it as a ring with its name and the Gizmo moves it. A sound source is a marker playing a
 // sound looped (a file of resource/sounds dropped on Viewport, or Add sound): its rings are the distances
-// it is heard at, the camera is the listener.
+// it is heard at, the camera is the listener. A trigger is a marker with a zone, a green cylinder: the script
+// tells who is where (CheckSceneTriggers) and gets SceneTriggerEnter and SceneTriggerExit.
+// Keys, over Viewport or this window in the edit: W move and E turn in the Gizmo, F flies the scene camera to
+// the object picked, Esc lets it go, Del deletes it, Ctrl+D duplicates it.
 
 #include "selection.hpp"
 
@@ -127,7 +130,10 @@ void SelectMarker(uint32_t id)
     storm::editor::GizmoTarget target;
     target.owner = invalid_entity;
     const SceneObject *picked = FindObject(id);
-    target.name = picked != nullptr && picked->IsSound() ? "sound" : "marker";
+    target.name = picked == nullptr      ? "marker"
+                  : picked->IsSound()   ? "sound"
+                  : picked->IsTrigger() ? "trigger"
+                                        : "marker";
     target.get = [id](float *matrix) {
         const SceneObject *object = SelectedMarkerId() == id ? FindObject(id) : nullptr;
         if (object != nullptr)
@@ -148,6 +154,11 @@ void SelectMarker(uint32_t id)
         {
             return fmt::format("// sound \"{}\" ({}): {:.3f}, {:.3f}, {:.3f}", object->name, object->sound, m[12], m[13],
                                m[14]);
+        }
+        if (object != nullptr && object->IsTrigger())
+        {
+            return fmt::format("// trigger \"{}\", radius {:.2f}, height {:.2f}: {:.3f}, {:.3f}, {:.3f}", object->name,
+                               object->radius, object->height, m[12], m[13], m[14]);
         }
         return fmt::format("GetSceneMarker(\"{}\", &place); // {:.3f}, {:.3f}, {:.3f}, ay {:.4f}",
                            object != nullptr ? object->name : "", m[12], m[13], m[14], std::atan2(m[8], m[10]));
@@ -175,6 +186,7 @@ void Apply(const Objects &target)
         {
             continue;
         }
+        // a model or a sound the script has hidden is made anew below: MadeAs tells it apart
         const auto it = std::find_if(objects.begin(), objects.end(), [&](const SceneObject &o) { return o.id == object.id; });
         const bool alive = it != objects.end() &&
                            (object.IsSound() ? it->voice != 0 : core.GetEntityPointerSafe(it->entity) != nullptr);
@@ -252,7 +264,8 @@ void Commit()
 {
     Editor &state = State();
     const Objects &objects = CurrentScene().objects;
-    if (Same(objects, state.committed) || ImGui::IsAnyItemActive() || ImGui::IsMouseDown(ImGuiMouseButton_Left) ||
+    // what the game changes in Play (the script moves, hides, plays) is not an edit: Stop gives it back
+    if (EngineEditor::IsPlaying() || Same(objects, state.committed) || ImGui::IsAnyItemActive() || ImGui::IsMouseDown(ImGuiMouseButton_Left) ||
         ImGuizmo::IsUsing())
     {
         return;
@@ -289,14 +302,16 @@ void NewScene()
 void SaveScene(const std::string &name)
 {
     Scene &scene = CurrentScene();
-    if (!WriteScene(name, scene.objects))
+    // in Play the scene as it was at Play: what the scripts have changed since is not saved
+    const Objects &objects = EngineEditor::IsPlaying() && State().play ? *State().play : scene.objects;
+    if (!WriteScene(name, objects))
     {
         State().error = "Cannot write " + ScenePath(name).generic_string();
         return;
     }
     State().error.clear();
     scene.name = name;
-    State().saved = scene.objects;
+    State().saved = objects;
     EngineEditor::SetSetting("Scene.File", name);
     core.Trace("EDITOR: scene saved to %s", ScenePath(name).generic_string().c_str());
 }
@@ -562,11 +577,12 @@ void AddSound(const std::string &sound, const CVECTOR &at)
     SelectMarker(object.id);
 }
 
-void AddMarker(const CVECTOR &at)
+void AddMarker(const CVECTOR &at, bool trigger = false)
 {
     SceneObject object;
     object.marker = true;
-    object.name = FreeName("marker");
+    object.name = FreeName(trigger ? "trigger" : "marker");
+    object.radius = trigger ? 1.5f : 0.f;
     object.matrix[12] = at.x;
     object.matrix[13] = at.y;
     object.matrix[14] = at.z;
@@ -639,6 +655,32 @@ void DrawSound(ImDrawList *draw, const SceneObject &object, bool selected)
     }
 }
 
+// A trigger: a cylinder of its zone, two rings and posts between them, and its name
+void DrawTrigger(ImDrawList *draw, const SceneObject &object, bool selected)
+{
+    const float *m = object.matrix;
+    const ImU32 colour = selected ? IM_COL32(255, 220, 60, 255) : IM_COL32(90, 230, 120, 230);
+    const float top[3] = {m[12], m[13] + object.height, m[14]};
+    DrawRing(draw, m + 12, object.radius, colour, 2.f);
+    DrawRing(draw, top, object.radius, (colour & 0x00FFFFFF) | 0x80000000, 1.f);
+    for (int i = 0; i < 4; ++i)
+    {
+        const float a = 1.5707963f * i;
+        const float low[3] = {m[12] + std::cos(a) * object.radius, m[13], m[14] + std::sin(a) * object.radius};
+        const float high[3] = {low[0], top[1], low[2]};
+        const auto from = ToScreen(low);
+        const auto to = ToScreen(high);
+        if (from && to)
+        {
+            draw->AddLine(*from, *to, (colour & 0x00FFFFFF) | 0x80000000, 1.f);
+        }
+    }
+    if (const auto at = ToScreen(top))
+    {
+        draw->AddText(ImVec2(at->x + 6.f, at->y - 16.f), colour, object.name.c_str());
+    }
+}
+
 // The markers over the frame: a ring on the ground of the marker, an arrow where it looks, its name; the
 // sound sources with their rings
 void DrawMarkers()
@@ -661,6 +703,11 @@ void DrawMarkers()
         if (object.IsSound())
         {
             DrawSound(draw, object, &object == selected);
+            continue;
+        }
+        if (object.IsTrigger())
+        {
+            DrawTrigger(draw, object, &object == selected);
             continue;
         }
         const float *m = object.matrix;
@@ -803,11 +850,59 @@ std::vector<std::string> SoundFiles()
     return files;
 }
 
+// The scene camera looks at the object from where it looks now, as far as the object is big
+void Focus(const SceneObject &object)
+{
+    storm::editor::SceneCamera &camera = EngineEditor::GetSceneCamera();
+    if (!camera.active || !camera.placed)
+    {
+        return;
+    }
+    float centre[3] = {object.matrix[12], object.matrix[13], object.matrix[14]};
+    float size = 1.f;
+    if (object.IsTrigger())
+    {
+        size = std::max(object.radius, object.height);
+        centre[1] += object.height * 0.5f;
+    }
+    else if (object.IsSound())
+    {
+        size = std::max(1.f, object.distance[0]);
+    }
+    else if (MODEL *model = dynamic_cast<MODEL *>(core.GetEntityPointerSafe(object.entity)))
+    {
+        NODE *root = model->GetNode(0);
+        if (root != nullptr && root->geo != nullptr)
+        {
+            GEOS::INFO info{};
+            root->geo->GetInfo(info);
+            size = std::max(0.5f, info.radius);
+            centre[1] += info.boxcenter.y;
+        }
+    }
+    else
+    {
+        // a marker: where the head of a man standing on it is
+        centre[1] += 1.f;
+    }
+    // the axes of the angles as the editor flies the camera: x the pitch down, y the yaw
+    const float cx = std::cos(camera.ang[0]), sx = std::sin(camera.ang[0]);
+    const float cy = std::cos(camera.ang[1]), sy = std::sin(camera.ang[1]);
+    const float forward[3] = {sy * cx, -sx, cy * cx};
+    const float away = size * 3.f + 1.f;
+    for (int i = 0; i < 3; ++i)
+    {
+        camera.pos[i] = centre[i] - forward[i] * away;
+    }
+}
+
 // the keys of the scene, unless a field takes the keys or the game has them (Viewport in the game)
 void Shortcuts()
 {
     const ImGuiIO &io = ImGui::GetIO();
-    const ImGuiWindow *focused = ImGui::GetCurrentContext()->NavWindow;
+    // the window, not its child: a click on the list of objects focuses "Scene/##objects..."
+    const ImGuiWindow *nav = ImGui::GetCurrentContext()->NavWindow;
+    const ImGuiWindow *focused = nav != nullptr ? nav->RootWindow : nullptr;
     if (io.WantTextInput || (EngineEditor::IsPlaying() && focused != nullptr && std::string_view(focused->Name) == "Viewport"))
     {
         return;
@@ -834,6 +929,29 @@ void Shortcuts()
         {
             Delete(object->id);
         }
+    }
+    // the letters only over Viewport and this window, and not while the right button flies the camera with WASD
+    const std::string_view window = focused != nullptr ? focused->Name : "";
+    if (io.KeyCtrl || io.KeyAlt || ImGui::IsMouseDown(ImGuiMouseButton_Right) ||
+        (window != "Viewport" && window != "Scene"))
+    {
+        return;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_W, false))
+    {
+        EngineEditor::SetSetting("Gizmo.Operation", "translate");
+    }
+    else if (ImGui::IsKeyPressed(ImGuiKey_E, false))
+    {
+        EngineEditor::SetSetting("Gizmo.Operation", "rotate");
+    }
+    else if (ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+    {
+        Select(invalid_entity);
+    }
+    else if (const SceneObject *object = Selected(); object != nullptr && ImGui::IsKeyPressed(ImGuiKey_F, false))
+    {
+        Focus(*object);
     }
 }
 
@@ -937,7 +1055,8 @@ void FileButtons()
         ImGui::EndPopup();
     }
     ImGui::SameLine();
-    const bool dirty = !SameFile(scene.objects, state.saved);
+    // in Play the scripts change the scene, Stop gives it back: that is not an edit to save
+    const bool dirty = !EngineEditor::IsPlaying() && !SameFile(scene.objects, state.saved);
     ImGui::TextFmt("{}{}", scene.name.empty() ? "(new scene)" : scene.name + ".scene", dirty ? " *" : "");
 
     ImGui::BeginDisabled(state.undo.empty());
@@ -986,6 +1105,13 @@ void FileButtons()
         AddMarker(ViewCentre());
     }
     ImGui::SetItemTooltip("A named place for the script: the player, an NPC (GetSceneMarker)");
+    ImGui::SameLine();
+    if (ImGui::Button("Add trigger"))
+    {
+        AddMarker(ViewCentre(), true);
+    }
+    ImGui::SetItemTooltip("A zone: the script tells who is where (CheckSceneTriggers),\n"
+                          "SceneTriggerEnter and SceneTriggerExit come when one comes in or leaves");
     ImGui::SameLine();
     if (ImGui::Button("Add sound"))
     {
@@ -1051,6 +1177,12 @@ void ObjectList()
                 ImGui::SameLine();
                 ImGui::TextDisabled("%s%s", object.sound.c_str(), missing ? "  (not playing)" : "");
             }
+            else if (object.IsTrigger())
+            {
+                ImGui::TextColored(ImVec4(0.35f, 0.9f, 0.47f, 1.f), "trigger");
+                ImGui::SameLine();
+                ImGui::TextDisabled("%.1f x %.1f m", object.radius, object.height);
+            }
             else if (object.marker)
             {
                 ImGui::TextColored(ImVec4(0.3f, 0.9f, 1.f, 1.f), "marker");
@@ -1114,12 +1246,27 @@ void SoundProperties(SceneObject &object)
     ImGui::TextDisabled("Move it with the window Gizmo");
 }
 
+// the zone of a trigger and what the script writes for it
+void TriggerProperties(SceneObject &object)
+{
+    ImGui::DragFloat("Radius", &object.radius, 0.05f, 0.1f, 100.f, "%.2f m");
+    ImGui::DragFloat("Height", &object.height, 0.05f, 0.1f, 100.f, "%.2f m");
+    object.radius = std::max(object.radius, 0.1f);
+    object.height = std::max(object.height, 0.1f);
+    ImGui::TextDisabled("A cylinder from its place up. The script, in its tick:");
+    ImGui::TextDisabled("CheckSceneTriggers(\"player\", x, y, z);");
+    ImGui::TextDisabled("then SceneTriggerEnter / SceneTriggerExit come with");
+    ImGui::TextDisabled("\"%s\" and \"player\" (GetEventData)", object.name.c_str());
+    ImGui::TextDisabled("Move it with the window Gizmo");
+}
+
 void ObjectProperties()
 {
     SceneObject *object = Selected();
     if (object == nullptr)
     {
-        ImGui::TextDisabled("Pick a model, a marker or a sound in the list or with a click in Viewport (in the edit)");
+        ImGui::TextDisabled("Pick a model, a marker, a sound or a trigger in the list or with a click in Viewport\n"
+                            "(in the edit); F flies the camera to it");
         return;
     }
     char name[64];
@@ -1131,6 +1278,11 @@ void ObjectProperties()
     if (object->IsSound())
     {
         SoundProperties(*object);
+        return;
+    }
+    if (object->IsTrigger())
+    {
+        TriggerProperties(*object);
         return;
     }
     if (object->marker)
@@ -1218,8 +1370,20 @@ void ShowScene(bool &active)
         {
             OpenScene(last);
         }
-        // a scene loaded by the game comes with its ids too (LoadScene numbers its objects)
-        Reset(scene.objects);
+        // a scene loaded by the game comes with its ids too (LoadScene numbers its objects). Its scripts
+        // have run by now and may have hidden or moved something: the scene as loaded is the one to edit,
+        // in Play Stop gives it back
+        const Objects loaded = scene.loaded.empty() ? scene.objects : scene.loaded;
+        Reset(loaded);
+        if (EngineEditor::IsPlaying())
+        {
+            state.play = loaded;
+        }
+        else
+        {
+            // Apply keeps what is made as it was (a hidden one is not)
+            Apply(loaded);
+        }
     }
 
     // the places the Gizmo has given the models; the sounds follow their markers
