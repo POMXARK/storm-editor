@@ -8,7 +8,7 @@ endif()
 STORM_SETUP(
         TARGET_NAME editor_tools
         TYPE storm_module
-        DEPENDENCIES core editor model renderer animation scene
+        DEPENDENCIES core editor model renderer animation scene sound_service
 )
 # the gizmos of the window Gizmo (MIT, from Conan of the engine)
 target_link_libraries(editor_tools PRIVATE imguizmo::imguizmo)

@@ -2,7 +2,8 @@
 // of the program folder, as a tree with the kind and the size of every file. A text one (.ini, .ani, .c)
 // shows on the right and is edited there, Ctrl+S saves it; a saved script is compiled again at once
 // (Core::ReloadScripts, globals and event handlers are kept), and its errors open the file on their line.
-// The picked file is kept between runs. A file is dragged onto Viewport by its path.
+// The picked file is kept between runs. A file is dragged onto Viewport by its path. A sound of
+// resource/sounds is played here (Play, Loop) through the sound service of the game.
 // A glTF model (.glb, .gltf, from Blender and others) is imported: the button Import runs the converter
 // tools/gltf2gm, put next to the engine by the build, and the new .gm is picked to be dragged.
 
@@ -10,12 +11,16 @@
 #include "file_service.h"
 #include "storm/editor/engine_editor.hpp"
 #include "storm/editor/storm_imgui.hpp"
+#include "v_sound_service.h"
 
 #include <fmt/format.h>
 #include <imgui_stdlib.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -402,6 +407,119 @@ int EditCallback(ImGuiInputTextCallbackData *data)
     return 0;
 }
 
+// the sound heard from the window
+struct Preview
+{
+    std::string file;
+    int32_t id = 0;
+    double started = 0.0;
+    bool loop = false;
+};
+
+Preview preview_;
+
+// the format of a .wav and how long it plays, from its chunks; empty for another file
+std::string WavInfo(const fs::path &path, double &seconds)
+{
+    std::ifstream in(path, std::ios::binary);
+    char riff[12];
+    if (!in.read(riff, sizeof(riff)) || std::memcmp(riff, "RIFF", 4) != 0 || std::memcmp(riff + 8, "WAVE", 4) != 0)
+    {
+        return {};
+    }
+    uint16_t channels = 0, bits = 0;
+    uint32_t rate = 0;
+    for (char chunk[8]; in.read(chunk, sizeof(chunk));)
+    {
+        uint32_t size = 0;
+        std::memcpy(&size, chunk + 4, 4);
+        if (std::memcmp(chunk, "fmt ", 4) == 0 && size >= 16)
+        {
+            char format[16];
+            in.read(format, sizeof(format));
+            std::memcpy(&channels, format + 2, 2);
+            std::memcpy(&rate, format + 4, 4);
+            std::memcpy(&bits, format + 14, 2);
+            in.seekg(size - 16 + (size & 1), std::ios::cur);
+        }
+        else if (std::memcmp(chunk, "data", 4) == 0)
+        {
+            const uint32_t frame = channels * bits / 8;
+            seconds = frame > 0 && rate > 0 ? static_cast<double>(size) / frame / rate : 0.0;
+            return fmt::format("{} Hz, {} bit, {}, {:.2f} s", rate, bits, channels == 1 ? "mono" : "stereo", seconds);
+        }
+        else
+        {
+            in.seekg(size + (size & 1), std::ios::cur);
+        }
+    }
+    return {};
+}
+
+void StopPreview()
+{
+    auto *sounds = core.GetServiceX<VSoundService>();
+    if (sounds != nullptr && preview_.id != 0)
+    {
+        sounds->SoundStop(preview_.id);
+    }
+    preview_.id = 0;
+}
+
+// Play and Stop of a sound of resource/sounds, which the service names from there ("demo\\waves.wav")
+void ShowSound(const std::string &selected)
+{
+    const fs::path relative = fs::path(selected).lexically_relative(fs::path("resource") / "sounds");
+    if (relative.empty() || *relative.begin() == "..")
+    {
+        ImGui::TextDisabled("Only the sounds of resource/sounds play");
+        return;
+    }
+    std::string name = relative.generic_string();
+    std::replace(name.begin(), name.end(), '/', '\\');
+    double seconds = 0.0;
+    const std::string info = WavInfo(selected, seconds);
+    if (!info.empty())
+    {
+        ImGui::TextDisabled("%s", info.c_str());
+    }
+    auto *sounds = core.GetServiceX<VSoundService>();
+    if (sounds == nullptr)
+    {
+        ImGui::TextDisabled("No sound service");
+        return;
+    }
+    const bool playing = preview_.id != 0 && preview_.file == selected && sounds->SoundIsPlaying(preview_.id);
+    ImGui::Separator();
+    if (ImGui::Button(playing ? "Stop" : "Play"))
+    {
+        StopPreview();
+        if (!playing)
+        {
+            VSoundService::SoundPlayOptions options;
+            options.type = PCM_STEREO;
+            options.looped = preview_.loop;
+            preview_.id = sounds->SoundPlay(name, options);
+            preview_.file = selected;
+            preview_.started = ImGui::GetTime();
+            if (preview_.id == 0)
+            {
+                core.Trace("EDITOR: the sound %s does not play", name.c_str());
+            }
+        }
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("Loop", &preview_.loop);
+    ImGui::SameLine();
+    ImGui::TextDisabled("drag it onto Viewport for a sound source of the scene");
+    if (playing && seconds > 0.0)
+    {
+        const double elapsed = std::fmod(ImGui::GetTime() - preview_.started, seconds);
+        ImGui::ProgressBar(static_cast<float>(elapsed / seconds), ImVec2(-1.f, 0.f),
+                           fmt::format("{:.1f} / {:.1f} s", elapsed, seconds).c_str());
+    }
+}
+
 void ShowFile(const std::string &selected)
 {
     if (selected.empty())
@@ -433,6 +551,11 @@ void ShowFile(const std::string &selected)
     if (std::string(Kind(path)) == "glTF")
     {
         ShowImport(selected);
+        return;
+    }
+    if (std::string(Kind(path)) == "sound")
+    {
+        ShowSound(selected);
         return;
     }
     const bool script = IsScript(path);

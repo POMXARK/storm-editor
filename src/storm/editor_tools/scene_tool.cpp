@@ -4,7 +4,9 @@
 // to resource/scenes/<name>.scene, a script loads it with LoadScene. Ctrl+Z / Ctrl+Y undo and redo every
 // change; Play keeps the scene and Stop gives it back as it was. A model may be animated (its skeleton and
 // the action it plays); a marker is a named place for the script (the player, an NPC): Add marker puts one,
-// Viewport shows it as a ring with its name and the Gizmo moves it.
+// Viewport shows it as a ring with its name and the Gizmo moves it. A sound source is a marker playing a
+// sound looped (a file of resource/sounds dropped on Viewport, or Add sound): its rings are the distances
+// it is heard at, the camera is the listener.
 
 #include "selection.hpp"
 
@@ -44,6 +46,7 @@ constexpr float kRayLength = 1000.f;
 // a click this near to a marker on the screen picks it, pixels; its ring is this big, metres
 constexpr float kMarkerPick = 14.f;
 constexpr float kMarkerRadius = 0.4f;
+const char *const kSoundExtensions[] = {".wav", ".ogg", ".mp3"};
 
 using Objects = std::vector<SceneObject>;
 
@@ -123,7 +126,8 @@ void SelectMarker(uint32_t id)
     SelectedMarkerId() = id;
     storm::editor::GizmoTarget target;
     target.owner = invalid_entity;
-    target.name = "marker";
+    const SceneObject *picked = FindObject(id);
+    target.name = picked != nullptr && picked->IsSound() ? "sound" : "marker";
     target.get = [id](float *matrix) {
         const SceneObject *object = SelectedMarkerId() == id ? FindObject(id) : nullptr;
         if (object != nullptr)
@@ -140,13 +144,19 @@ void SelectMarker(uint32_t id)
     };
     target.script = [id](const float *m) {
         const SceneObject *object = FindObject(id);
+        if (object != nullptr && object->IsSound())
+        {
+            return fmt::format("// sound \"{}\" ({}): {:.3f}, {:.3f}, {:.3f}", object->name, object->sound, m[12], m[13],
+                               m[14]);
+        }
         return fmt::format("GetSceneMarker(\"{}\", &place); // {:.3f}, {:.3f}, {:.3f}, ay {:.4f}",
                            object != nullptr ? object->name : "", m[12], m[13], m[14], std::atan2(m[8], m[10]));
     };
     EngineEditor::SetGizmoTarget(std::move(target));
 }
 
-// The scene becomes the one given: the models that are the same stay and move, the others are made anew
+// The scene becomes the one given: the models and sounds that are the same stay and move, the others are
+// made anew
 void Apply(const Objects &target)
 {
     Objects &objects = CurrentScene().objects;
@@ -158,17 +168,22 @@ void Apply(const Objects &target)
     Objects next = target;
     for (SceneObject &object : next)
     {
-        if (object.marker)
+        // a snapshot of the undo keeps the handles of its time, the ones of now are taken below
+        object.entity = invalid_entity;
+        object.voice = 0;
+        if (object.marker && !object.IsSound())
         {
             continue;
         }
         const auto it = std::find_if(objects.begin(), objects.end(), [&](const SceneObject &o) { return o.id == object.id; });
-        if (it != objects.end() && it->geometry == object.geometry && it->technique == object.technique &&
-            it->textures == object.textures && it->animation == object.animation && it->action == object.action &&
-            core.GetEntityPointerSafe(it->entity) != nullptr)
+        const bool alive = it != objects.end() &&
+                           (object.IsSound() ? it->voice != 0 : core.GetEntityPointerSafe(it->entity) != nullptr);
+        if (alive && it->MadeAs(object))
         {
             object.entity = it->entity;
+            object.voice = it->voice;
             it->entity = invalid_entity;
+            it->voice = 0;
             WritePlace(object);
         }
         else
@@ -509,6 +524,44 @@ CVECTOR ViewCentre()
     return DropPoint(rect.x + rect.width / 2.f, rect.y + rect.height / 2.f);
 }
 
+// "resource/sounds/demo/waves.wav" as the sound service takes it: "demo\waves.wav"; empty for no sound
+std::string SoundName(const std::string &asset)
+{
+    const fs::path path(asset);
+    if (std::find(std::begin(kSoundExtensions), std::end(kSoundExtensions), path.extension().string()) ==
+        std::end(kSoundExtensions))
+    {
+        return {};
+    }
+    const fs::path relative = path.lexically_relative(fs::path("resource") / "sounds");
+    if (relative.empty() || *relative.begin() == "..")
+    {
+        return {};
+    }
+    std::string sound = relative.generic_string();
+    std::replace(sound.begin(), sound.end(), '/', '\\');
+    return sound;
+}
+
+void AddSound(const std::string &sound, const CVECTOR &at)
+{
+    SceneObject object;
+    object.marker = true;
+    object.sound = sound;
+    const fs::path file(std::string(sound.begin() + (sound.find_last_of('\\') + 1), sound.end()));
+    object.name = FreeName(file.stem().string());
+    object.matrix[12] = at.x;
+    object.matrix[13] = at.y;
+    object.matrix[14] = at.z;
+    object.id = ++State().lastId;
+    if (!Spawn(object))
+    {
+        State().error = fmt::format("The sound {} does not play (see compile.log)", sound);
+    }
+    CurrentScene().objects.push_back(object);
+    SelectMarker(object.id);
+}
+
 void AddMarker(const CVECTOR &at)
 {
     SceneObject object;
@@ -554,7 +607,40 @@ std::optional<ImVec2> ToScreen(const float *point)
                   rect.y + (1.f - clip[1] / clip[3]) * 0.5f * rect.height);
 }
 
-// The markers over the frame: a ring on the ground of the marker, an arrow where it looks, its name
+// A ring round a point of the world, flat, of the parts in front of the camera
+void DrawRing(ImDrawList *draw, const float *centre, float radius, ImU32 colour, float thickness)
+{
+    constexpr int kSteps = 48;
+    std::optional<ImVec2> last;
+    for (int i = 0; i <= kSteps; ++i)
+    {
+        const float a = 6.2831853f * i / kSteps;
+        const float point[3] = {centre[0] + std::cos(a) * radius, centre[1], centre[2] + std::sin(a) * radius};
+        const auto at = ToScreen(point);
+        if (at && last)
+        {
+            draw->AddLine(*last, *at, colour, thickness);
+        }
+        last = at;
+    }
+}
+
+// A sound source: a small ring and its name, and the rings it is heard in, full and faint
+void DrawSound(ImDrawList *draw, const SceneObject &object, bool selected)
+{
+    const float *m = object.matrix;
+    const ImU32 colour = selected ? IM_COL32(255, 220, 60, 255) : IM_COL32(255, 150, 60, 230);
+    DrawRing(draw, m + 12, kMarkerRadius, colour, 2.f);
+    DrawRing(draw, m + 12, object.distance[0], (colour & 0x00FFFFFF) | 0xA0000000, 1.f);
+    DrawRing(draw, m + 12, object.distance[1], (colour & 0x00FFFFFF) | 0x50000000, 1.f);
+    if (const auto at = ToScreen(m + 12))
+    {
+        draw->AddText(ImVec2(at->x + 6.f, at->y - 16.f), colour, object.name.c_str());
+    }
+}
+
+// The markers over the frame: a ring on the ground of the marker, an arrow where it looks, its name; the
+// sound sources with their rings
 void DrawMarkers()
 {
     ImDrawList *draw = EngineEditor::GetViewportDrawList();
@@ -570,6 +656,11 @@ void DrawMarkers()
     {
         if (!object.marker)
         {
+            continue;
+        }
+        if (object.IsSound())
+        {
+            DrawSound(draw, object, &object == selected);
             continue;
         }
         const float *m = object.matrix;
@@ -642,6 +733,7 @@ void Duplicate(const SceneObject &source)
     copy.matrix[12] += 0.5f;
     if (copy.marker)
     {
+        Spawn(copy);
         CurrentScene().objects.push_back(copy);
         SelectMarker(copy.id);
     }
@@ -699,6 +791,18 @@ std::vector<std::string> Files(const fs::path &root, const char *extension)
     return files;
 }
 
+std::vector<std::string> SoundFiles()
+{
+    std::vector<std::string> files;
+    for (const char *extension : kSoundExtensions)
+    {
+        const auto found = Files(fs::path("resource") / "sounds", extension);
+        files.insert(files.end(), found.begin(), found.end());
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
 // the keys of the scene, unless a field takes the keys or the game has them (Viewport in the game)
 void Shortcuts()
 {
@@ -742,13 +846,18 @@ void ViewportInput()
     if (EngineEditor::TakeViewportDrop(asset, x, y))
     {
         const std::string geometry = Geometry(asset);
-        if (geometry.empty())
+        const std::string sound = SoundName(asset);
+        if (!geometry.empty())
         {
-            State().error = fmt::format("{} is no model of resource/models", asset);
+            AddModel(geometry, DropPoint(x, y));
+        }
+        else if (!sound.empty())
+        {
+            AddSound(sound, DropPoint(x, y));
         }
         else
         {
-            AddModel(geometry, DropPoint(x, y));
+            State().error = fmt::format("{} is no model of resource/models, no sound of resource/sounds", asset);
         }
     }
     if (EngineEditor::TakeViewportClick(x, y) && !EngineEditor::IsPlaying() && !ImGuizmo::IsOver() && !ImGuizmo::IsUsing())
@@ -877,6 +986,29 @@ void FileButtons()
         AddMarker(ViewCentre());
     }
     ImGui::SetItemTooltip("A named place for the script: the player, an NPC (GetSceneMarker)");
+    ImGui::SameLine();
+    if (ImGui::Button("Add sound"))
+    {
+        ImGui::OpenPopup("add sound");
+    }
+    ImGui::SetItemTooltip("A sound playing here over and over; or drag a sound from Assets onto Viewport");
+    if (ImGui::BeginPopup("add sound"))
+    {
+        const auto files = SoundFiles();
+        if (files.empty())
+        {
+            ImGui::TextDisabled("No sounds in resource/sounds");
+        }
+        for (const std::string &file : files)
+        {
+            const std::string sound = SoundName(file);
+            if (ImGui::Selectable(sound.c_str()))
+            {
+                AddSound(sound, ViewCentre());
+            }
+        }
+        ImGui::EndPopup();
+    }
 }
 
 void ObjectList()
@@ -894,7 +1026,8 @@ void ObjectList()
         for (SceneObject &object : objects)
         {
             ImGui::PushID(static_cast<int>(object.id));
-            const bool missing = !object.marker && core.GetEntityPointerSafe(object.entity) == nullptr;
+            const bool missing = object.IsSound() ? object.voice == 0
+                                                  : !object.marker && core.GetEntityPointerSafe(object.entity) == nullptr;
             if (ImGui::Selectable(object.name.c_str(), &object == selected))
             {
                 object.marker ? SelectMarker(object.id) : Select(object.entity);
@@ -912,7 +1045,13 @@ void ObjectList()
                 ImGui::EndPopup();
             }
             ImGui::SameLine();
-            if (object.marker)
+            if (object.IsSound())
+            {
+                ImGui::TextColored(ImVec4(1.f, 0.6f, 0.25f, 1.f), "sound");
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s%s", object.sound.c_str(), missing ? "  (not playing)" : "");
+            }
+            else if (object.marker)
             {
                 ImGui::TextColored(ImVec4(0.3f, 0.9f, 1.f, 1.f), "marker");
             }
@@ -935,12 +1074,52 @@ void ObjectList()
     }
 }
 
+// the sound, its loudness and distances; it plays anew once a change is done
+void SoundProperties(SceneObject &object)
+{
+    auto replay = [&object] {
+        Despawn(object);
+        Spawn(object);
+    };
+    if (ImGui::BeginCombo("Sound", object.sound.c_str()))
+    {
+        for (const std::string &file : SoundFiles())
+        {
+            const std::string sound = SoundName(file);
+            if (ImGui::Selectable(sound.c_str(), sound == object.sound))
+            {
+                object.sound = sound;
+                replay();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SetItemTooltip("A file of resource/sounds; the file may name an alias of resource/ini/aliases instead");
+    ImGui::SliderFloat("Volume", &object.volume, 0.f, 1.f, "%.2f");
+    if (ImGui::IsItemDeactivatedAfterEdit())
+    {
+        replay();
+    }
+    if (ImGui::DragFloat2("Distance", object.distance, 0.1f, 0.f, 500.f, "%.1f m"))
+    {
+        object.distance[0] = std::max(0.f, std::min(object.distance[0], object.distance[1]));
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit())
+    {
+        replay();
+    }
+    ImGui::SetItemTooltip("Full up to the first, silent from the second; the rings in Viewport");
+    ImGui::TextDisabled(object.voice != 0 ? "Plays looped here, in the edit too; the camera hears it"
+                                          : "Does not play: no such sound (see compile.log)");
+    ImGui::TextDisabled("Move it with the window Gizmo");
+}
+
 void ObjectProperties()
 {
     SceneObject *object = Selected();
     if (object == nullptr)
     {
-        ImGui::TextDisabled("Pick a model or a marker in the list or with a click in Viewport (in the edit)");
+        ImGui::TextDisabled("Pick a model, a marker or a sound in the list or with a click in Viewport (in the edit)");
         return;
     }
     char name[64];
@@ -948,6 +1127,11 @@ void ObjectProperties()
     if (ImGui::InputText("Name", name, sizeof(name)))
     {
         object->name = name;
+    }
+    if (object->IsSound())
+    {
+        SoundProperties(*object);
+        return;
     }
     if (object->marker)
     {
@@ -1038,10 +1222,10 @@ void ShowScene(bool &active)
         Reset(scene.objects);
     }
 
-    // the places the Gizmo has given the models
+    // the places the Gizmo has given the models; the sounds follow their markers
     for (SceneObject &object : scene.objects)
     {
-        ReadPlace(object);
+        object.marker ? WritePlace(object) : ReadPlace(object);
     }
     ViewportInput();
     Shortcuts();
